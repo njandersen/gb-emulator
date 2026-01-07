@@ -74,6 +74,10 @@ pub const CPU = struct {
     fn getDE(self: *CPU) u16 {
         return (@as(u16, self.d) << 8) | self.e;
     }
+    fn setDE(self: *CPU, val: u16) void {
+        self.d = @truncate(val >> 8);
+        self.e = @truncate(val & 0xFF);
+    }
 
     fn setHL(self: *CPU, val: u16) void {
         self.h = @truncate(val >> 8);
@@ -81,6 +85,15 @@ pub const CPU = struct {
     }
     fn getHL(self: *CPU) u16 {
         return (@as(u16, self.h) << 8) | @as(u16, self.l);
+    }
+
+    fn getFlagsAsByte(self: *CPU) u8 {
+        var res: u8 = 0;
+        if (self.f.z) res |= 0x80;
+        if (self.f.n) res |= 0x40;
+        if (self.f.h) res |= 0x20;
+        if (self.f.c) res |= 0x10;
+        return res;
     }
 
     // --- Instruction Methods ---
@@ -116,10 +129,21 @@ pub const CPU = struct {
         self.f.c = false;
     }
 
+    fn setFlagsFromByte(self: *CPU, byte: u8) void {
+        self.f.z = (byte & 0x80) != 0;
+        self.f.n = (byte & 0x40) != 0;
+        self.f.h = (byte & 0x20) != 0;
+        self.f.c = (byte & 0x10) != 0;
+    }
+
     // --- The Main Step ---
     pub fn step(self: *CPU) !void {
         const current_pc = self.pc;
         const opcode = self.fetchByte();
+        if (self.pc == 0x27AD) { // 0x27AD is the instruction AFTER the loop
+            std.debug.print("I FINALLY ESCAPED THE LOOP! BC is now: {X:0>4}\n", .{self.getBC()});
+        }
+
         switch (opcode) {
             0x00 => {
                 // NOP
@@ -172,15 +196,13 @@ pub const CPU = struct {
                 self.f.z = (self.b == 0); // Is it zero?
                 self.f.n = true; // Yes, we subtracted.
             },
-            0x20 => { // JR NZ, s8 (2 bytes)
+            0x20 => { // JR NZ, r8
                 const offset = @as(i8, @bitCast(self.fetchByte()));
                 if (!self.f.z) {
-                    const new_pc = @as(i16, @intCast(self.pc)) + offset;
-                    self.pc = @as(u16, @intCast(new_pc));
-                    std.debug.print("NZ Flag is set! Looping back to 0x{X:0>4}\n", .{self.pc});
-                } else {
-                    // If it IS zero, the loop is finished. Just keep going.
-                    std.debug.print("Loop finished, continuing...\n", .{});
+                    // Use wrapping addition to handle the jump
+                    const current_pc_i16 = @as(i16, @bitCast(self.pc));
+                    const new_pc_i16 = current_pc_i16 + offset;
+                    self.pc = @as(u16, @bitCast(new_pc_i16));
                 }
             },
             0x0D => {
@@ -195,8 +217,7 @@ pub const CPU = struct {
                 self.a = self.fetchByte();
             },
             0xF3 => { // DI (1 byte)
-                // In a full emulator, you'd set a flag like: self.interrupts_enabled = false;
-                // For now, just move the needle.
+                self.ime = false;
             },
             0xE0 => { // LDH (a8), A (2 bytes)
                 const offset = self.fetchByte();
@@ -211,13 +232,20 @@ pub const CPU = struct {
                 // Ready for next opcode
             },
             0xFE => { // CP d8
-                const pc_before = self.pc;
                 const value = self.fetchByte();
-                std.debug.print("CP Check: A=0x{X:0>2}, ValueRead=0x{X:0>2} from PC: 0x{X:0>4}\n", .{ self.a, value, pc_before });
 
+                // Z: Set if A == value (result is 0)
                 self.f.z = (self.a == value);
+
+                // N: Always set for CP (it is a subtraction)
                 self.f.n = true;
-                // ... rest of flags
+
+                // H: Set if there was no borrow from bit 4
+                // (Calculation: (A & 0x0F) < (value & 0x0F))
+                self.f.h = (self.a & 0x0F) < (value & 0x0F);
+
+                // C: Set if A < value (a "borrow" occurred)
+                self.f.c = self.a < value;
             },
             0x36 => { // LD (HL), d8
                 const value = self.fetchByte();
@@ -291,7 +319,7 @@ pub const CPU = struct {
                 self.a = self.b;
             },
             0xB1 => { // OR C
-                self.a = self.a | self.c;
+                self.a |= self.c;
 
                 // Update flags
                 self.f.z = (self.a == 0);
@@ -492,6 +520,150 @@ pub const CPU = struct {
             },
             0xE9 => { // JP (HL)
                 self.pc = self.getHL();
+            },
+            0x11 => { // LD DE, d16
+                const low = self.fetchByte();
+                const high = self.fetchByte();
+                self.e = low;
+                self.d = high;
+            },
+            0x12 => { // LD (DE), A
+                const address = self.getDE();
+                self.writeByte(address, self.a);
+            },
+            0x02 => {
+                // LD (BC), A
+                const addr = self.getBC();
+                self.writeByte(addr, self.a);
+            },
+            0x13 => {
+                // INC DE
+                const val = self.getDE();
+                self.setDE(val +% 1);
+            },
+            0xE5 => {
+                // PUSH HL
+                // 1. Decrement SP and write High byte (H)
+                self.sp -%= 1;
+                self.writeByte(self.sp, self.h);
+
+                // 2. Decrement SP and write Low byte (L)
+                self.sp -%= 1;
+                self.writeByte(self.sp, self.l);
+            },
+            0x1A => {
+                // LD A, (DE)
+                self.a = self.readByte(self.getDE());
+            },
+            0x22 => { // LD (HL+), A
+                const addr = self.getHL();
+                self.writeByte(addr, self.a);
+                self.setHL(addr +% 1);
+            },
+            0xD1 => {
+                // POP DE
+                self.e = self.readByte(self.sp);
+                self.sp +%= 1;
+
+                self.d = self.readByte(self.sp);
+                self.sp +%= 1;
+            },
+            0x7C => {
+                // LD A, H
+                self.a = self.h;
+            },
+            0xF5 => {
+                // PUSH AF
+                self.sp -%= 1;
+                self.writeByte(self.sp, self.a);
+
+                self.sp -%= 1;
+                self.writeByte(self.sp, self.getFlagsAsByte()); // Low byte (F)
+            },
+            0xC5 => {
+                // PUSH BC
+                self.sp -%= 1;
+                self.writeByte(self.sp, self.b);
+
+                self.sp -%= 1;
+                self.writeByte(self.sp, self.c);
+            },
+            0xFA => { // LD A, (nn)
+                const addr = self.fetchU16();
+                self.a = self.readByte(addr);
+            },
+            0x28 => { // JR Z, r8
+                const offset = @as(i8, @bitCast(self.fetchByte()));
+                if (self.f.z) {
+                    // Only jump if Zero flag is true
+                    self.pc = @as(u16, @bitCast(@as(i16, @intCast(self.pc)) + offset));
+                }
+            },
+            0xA7 => {
+                // AND A
+                self.a &= self.a;
+
+                // Update Flags
+                self.f.z = (self.a == 0);
+                self.f.n = false;
+                self.f.h = true; // AND always sets H flag
+                self.f.c = false;
+            },
+            0x1C => {
+                // INC E
+                const old_val = self.e;
+                self.e = self.e +% 1;
+                self.f.z = (self.e == 0);
+                self.f.n = false;
+                // Half-carry: did bit 3 overflow?
+                self.f.h = (old_val & 0x0F) == 0x0F;
+                // Note: Carry flag (C) is NOT affected by INC instructions!
+            },
+            0xCA => {
+                // JP Z, a16
+                const low = self.fetchByte();
+                const high = self.fetchByte();
+                const address = (@as(u16, high) << 8) | low;
+
+                if (self.f.z) {
+                    self.pc = address;
+                }
+            },
+            0xC8 => {
+                // RET Z
+                if (self.f.z) {
+                    const low = self.readByte(self.sp);
+                    self.sp +%= 1;
+                    const high = self.readByte(self.sp);
+                    self.sp +%= 1;
+                    self.pc = (@as(u16, high) << 8) | low;
+                }
+            },
+            0x18 => { // JR s8
+                const offset = @as(i8, @bitCast(self.fetchByte()));
+                // We cast to i16 to handle the signed math before putting it back into the u16 PC
+                const new_pc = @as(i16, @intCast(self.pc)) + offset;
+                self.pc = @as(u16, @bitCast(new_pc));
+            },
+            0xC1 => {
+                // POP BC
+                self.c = self.readByte(self.sp);
+                self.sp +%= 1;
+
+                self.b = self.readByte(self.sp);
+                self.sp +%= 1;
+            },
+            0xF1 => { // POP AF
+                // 1. Pop the Low byte (Flags)
+                const f_raw = self.readByte(self.sp);
+                self.sp +%= 1;
+
+                // 2. Pop the High byte (Accumulator)
+                self.a = self.readByte(self.sp);
+                self.sp +%= 1;
+
+                // 3. Mask the flags: only Z, N, H, C (top 4 bits) are kept
+                self.setFlagsFromByte(f_raw & 0xF0);
             },
             0xCB => try self.decodeCB(),
             else => {
