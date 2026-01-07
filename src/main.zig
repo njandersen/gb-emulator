@@ -15,6 +15,8 @@ const GameBoy = struct {
     sp: u16 = 0xFFFE, // Stack Pointer
     // Memory: 64KB of addressable memory
     bus: [65536]u8 = [_]u8{0} ** 65536,
+    ime: bool = false,
+
     fn fetchByte(self: *GameBoy) u8 {
         const val = self.bus[self.pc];
         self.pc += 1;
@@ -189,6 +191,62 @@ const GameBoy = struct {
                 self.bus[self.sp] = @truncate(return_addr & 0xFF);
                 self.pc = target_addr;
                 std.debug.print("Calling subroutine at 0x{X:0>4}, return address 0x{X:0>4}\n", .{ target_addr, return_addr });
+            },
+            0x01 => { // LD BC, d16
+                const value = self.fetchU16();
+                self.setBC(value);
+                // PC is now at 0x279B
+            },
+            0x0B => { // DEC BC
+                const val = self.getBC();
+                self.setBC(val -% 1); // Use wrapping subtraction
+                // No flags are changed!
+            },
+            0x78 => { // LD A, B
+                self.a = self.b;
+            },
+            0xB1 => { // OR C
+                self.a = self.a | self.c;
+
+                // Update flags
+                self.f.z = (self.a == 0);
+                self.f.n = false;
+                self.f.h = false;
+                self.f.c = false;
+            },
+            0xC9 => { // RET
+                // 1. Pop the Low Byte
+                const low = @as(u16, self.bus[self.sp]);
+                self.sp +%= 1;
+
+                // 2. Pop the High Byte
+                const high = @as(u16, self.bus[self.sp]);
+                self.sp +%= 1;
+
+                // 3. Jump back home!
+                self.pc = (high << 8) | low;
+
+                std.debug.print("Returning from subroutine to 0x{X:0>4}\n", .{self.pc});
+            },
+            0xFB => { // EI
+                // For a basic emulator, we can just set it to true.
+                self.ime = true;
+            },
+            0x2F => {
+                // CPL
+                self.a = ~self.a; // ~ bitwise NOT operator
+                self.f.n = true;
+                self.f.h = true;
+            },
+            0xE6 => { // AND d8
+                const mask = self.fetchByte();
+                self.a &= mask;
+
+                // Update flags
+                self.f.z = (self.a == 0);
+                self.f.n = false;
+                self.f.h = true; // Yes, H is always true for AND!
+                self.f.c = false;
             },
             else => {
                 std.debug.print("CRASH: Unknown opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ opcode, self.pc });
