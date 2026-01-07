@@ -1,0 +1,7 @@
+*.gb
+.zig-cache
+roms
+zig-out
+
+.DS_Store
+
