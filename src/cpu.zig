@@ -136,9 +136,47 @@ pub const CPU = struct {
         self.f.c = (byte & 0x10) != 0;
     }
 
-    // --- The Main Step ---
-    pub fn step(self: *CPU) !void {
-        const current_pc = self.pc;
+    //===============================================================================================
+    // Interrupts
+    //===============================================================================================
+    pub fn handleInterrupts(self: *CPU) void {
+        if (!self.ime) return; // Master enable must be on
+
+        const ie = self.readByte(0xFFFF); // Interrupt Enable
+        const if_reg = self.readByte(0xFF0F); // Interrupt Flag
+        const pending = ie & if_reg;
+
+        if (pending > 0) {
+            // V-Blank has highest priority (Bit 0)
+            if (pending & 0x01 != 0) {
+                self.serviceInterrupt(0, 0x0040);
+            }
+            // ... handle other bits (LCD Stat, Timer, etc.)
+        }
+    }
+
+    fn serviceInterrupt(self: *CPU, bit: u3, vector: u16) void {
+        self.ime = false; // Disable interrupts
+
+        // Clear the specific bit we are servicing in IF
+        var if_reg = self.readByte(0xFF0F);
+        if_reg &= ~(@as(u8, 1) << bit);
+        self.writeByte(0xFF0F, if_reg);
+
+        // Push PC to stack
+        self.sp -%= 1;
+        self.writeByte(self.sp, @as(u8, @truncate(self.pc >> 8)));
+        self.sp -%= 1;
+        self.writeByte(self.sp, @as(u8, @truncate(self.pc & 0xFF)));
+
+        // Jump to the interrupt vector
+        self.pc = vector;
+    }
+
+    //===============================================================================================
+    // Main Step
+    //===============================================================================================
+    pub fn step(self: *CPU) u8 {
         const opcode = self.fetchByte();
         if (self.pc == 0x27AD) { // 0x27AD is the instruction AFTER the loop
             std.debug.print("I FINALLY ESCAPED THE LOOP! BC is now: {X:0>4}\n", .{self.getBC()});
@@ -147,10 +185,12 @@ pub const CPU = struct {
         switch (opcode) {
             0x00 => {
                 // NOP
+                return 1;
             },
             0x31 => {
                 // LD SP, d16 (3 bytes: opcode + 2 bytes for address)
                 self.sp = self.fetchU16();
+                return 3;
             },
             0xAF => { // XOR A (1 byte)
                 // This is a common trick to set Register A to 0.
@@ -164,21 +204,27 @@ pub const CPU = struct {
                     .h = false,
                     .c = false,
                 };
+
+                return 1;
             },
             0x21 => { // LD HL, d16 (3 bytes)
                 // Load an immediate 16-bit value into the H and L registers
                 const val = self.fetchU16();
                 self.h = @truncate(val >> 8);
                 self.l = @truncate(val & 0xFF);
+                return 3;
             },
             0xC3 => { // JP nn (jump to 16-bit address)
                 self.pc = self.fetchU16();
+                return 4;
             },
             0x0E => { // LD C, d8
                 self.c = self.fetchByte();
+                return 2;
             },
             0x06 => { // LD B, d8
                 self.b = self.fetchByte();
+                return 2;
             },
             0x32 => { // LD (HL-), A (1 byte)
                 // 1. Get the 16-bit address currently held by H and L
@@ -189,12 +235,15 @@ pub const CPU = struct {
                 const new_hl = hl -% 1; // -% is "Wrapping Subtraction" in Zig
                 self.h = @as(u8, @truncate(new_hl >> 8));
                 self.l = @as(u8, @truncate(new_hl & 0xFF));
+                return 2;
             },
             0x05 => { // DEC B (1 byte)
                 self.b = self.b -% 1;
                 // Set the "notes" for the next instruction
                 self.f.z = (self.b == 0); // Is it zero?
                 self.f.n = true; // Yes, we subtracted.
+
+                return 1;
             },
             0x20 => { // JR NZ, r8
                 const offset = @as(i8, @bitCast(self.fetchByte()));
@@ -203,7 +252,9 @@ pub const CPU = struct {
                     const current_pc_i16 = @as(i16, @bitCast(self.pc));
                     const new_pc_i16 = current_pc_i16 + offset;
                     self.pc = @as(u16, @bitCast(new_pc_i16));
+                    return 3;
                 }
+                return 2;
             },
             0x0D => {
                 // DEC C (1 byte)
@@ -211,18 +262,22 @@ pub const CPU = struct {
                 // Set the "notes" for the next instruction
                 self.f.z = (self.c == 0); // Is it zero?
                 self.f.n = true; // Yes, we subtracted.
+                return 1;
             },
             0x3E => {
                 // LD A, d8 (2 bytes)
                 self.a = self.fetchByte();
+                return 2;
             },
             0xF3 => { // DI (1 byte)
                 self.ime = false;
+                return 1;
             },
             0xE0 => { // LDH (a8), A (2 bytes)
                 const offset = self.fetchByte();
                 const address = 0xFF00 + @as(u16, offset);
                 self.writeByte(address, self.a);
+                return 3;
             },
             0xF0 => { // LDH A, (a8)
                 const offset = self.fetchByte();
@@ -230,6 +285,7 @@ pub const CPU = struct {
                 // Read from the bus and put it in A
                 self.a = self.readByte(address);
                 // Ready for next opcode
+                return 3;
             },
             0xFE => { // CP d8
                 const value = self.fetchByte();
@@ -246,6 +302,7 @@ pub const CPU = struct {
 
                 // C: Set if A < value (a "borrow" occurred)
                 self.f.c = self.a < value;
+                return 2;
             },
             0x36 => { // LD (HL), d8
                 const value = self.fetchByte();
@@ -254,6 +311,7 @@ pub const CPU = struct {
                 // Write the value to that address
                 self.writeByte(hl, value);
                 // PC is already handled by fetchByte
+                return 3;
             },
             0xEA => { // LD (a16), A
                 // Use your helper to grab the next two bytes as a u16
@@ -262,10 +320,12 @@ pub const CPU = struct {
                 self.writeByte(address, self.a);
 
                 // No pc += 3 needed because fetchU16 handles the movement!
+                return 4;
             },
             0x77 => { // LD (HL), A
                 const hl = (@as(u16, self.h) << 8) | self.l;
                 self.writeByte(hl, self.a);
+                return 2;
             },
             0x2A => { // LD A, (HL+)
                 const hl = (@as(u16, self.h) << 8) | self.l;
@@ -276,10 +336,12 @@ pub const CPU = struct {
                 self.h = @as(u8, @truncate(new_hl >> 8));
                 self.l = @as(u8, @truncate(new_hl & 0xFF));
                 // PC was already moved by the fetchByte at the start of step()
+                return 2;
             },
             0xE2 => { // LD (C), A
                 const address = 0xFF00 + @as(u16, self.c);
                 self.writeByte(address, self.a);
+                return 2;
             },
             0x0C => { // INC C
                 const old_val = self.c;
@@ -289,6 +351,7 @@ pub const CPU = struct {
                 // Half-carry: did bit 3 overflow?
                 self.f.h = (old_val & 0x0F) == 0x0F;
                 // Note: Carry flag (C) is NOT affected by INC instructions!
+                return 1;
             },
             0xCD => { // CALL nn
                 const target_addr = self.fetchU16();
@@ -304,19 +367,23 @@ pub const CPU = struct {
 
                 self.pc = target_addr;
                 std.debug.print("Calling subroutine at 0x{X:0>4}, return address 0x{X:0>4}\n", .{ target_addr, return_addr });
+                return 6;
             },
             0x01 => { // LD BC, d16
                 const value = self.fetchU16();
                 self.setBC(value);
                 // PC is now at 0x279B
+                return 3;
             },
             0x0B => { // DEC BC
                 const val = self.getBC();
                 self.setBC(val -% 1); // Use wrapping subtraction
                 // No flags are changed!
+                return 2;
             },
             0x78 => { // LD A, B
                 self.a = self.b;
+                return 1;
             },
             0xB1 => { // OR C
                 self.a |= self.c;
@@ -326,6 +393,7 @@ pub const CPU = struct {
                 self.f.n = false;
                 self.f.h = false;
                 self.f.c = false;
+                return 1;
             },
             0xC9 => { // RET
                 // 1. Pop the Low Byte
@@ -340,16 +408,19 @@ pub const CPU = struct {
                 self.pc = (high << 8) | low;
 
                 std.debug.print("Returning from subroutine to 0x{X:0>4}\n", .{self.pc});
+                return 4;
             },
             0xFB => { // EI
                 // For a basic emulator, we can just set it to true.
                 self.ime = true;
+                return 1;
             },
             0x2F => {
                 // CPL
                 self.a = ~self.a; // ~ bitwise NOT operator
                 self.f.n = true;
                 self.f.h = true;
+                return 1;
             },
             0xE6 => { // AND d8
                 const mask = self.fetchByte();
@@ -360,35 +431,43 @@ pub const CPU = struct {
                 self.f.n = false;
                 self.f.h = true; // Yes, H is always true for AND!
                 self.f.c = false;
+                return 2;
             },
             0x37 => { // SCF (Set Carry Flag)
                 self.f.n = false;
                 self.f.h = false;
                 self.f.c = true;
                 // Note: Z is NOT affected by SCF
+                return 1;
             },
             0x47 => { // LD B, A
                 self.b = self.a;
+                return 1;
             },
             0x4F => {
                 // LD C, A
                 self.c = self.a;
+                return 1;
             },
             0x57 => {
                 // LD D, A
                 self.d = self.a;
+                return 1;
             },
             0x5F => {
                 // LD E, A
                 self.e = self.a;
+                return 1;
             },
             0x67 => {
                 // LD H, A
                 self.h = self.a;
+                return 1;
             },
             0x6F => {
                 // LD L, A
                 self.l = self.a;
+                return 1;
             },
             0xB0 => { // OR B
                 self.a |= self.b;
@@ -398,6 +477,7 @@ pub const CPU = struct {
                 self.f.n = false;
                 self.f.h = false;
                 self.f.c = false;
+                return 1;
             },
             0xA9 => { // XOR C
                 self.a ^= self.c;
@@ -407,6 +487,7 @@ pub const CPU = struct {
                 self.f.n = false;
                 self.f.h = false;
                 self.f.c = false;
+                return 1;
             },
             0xA1 => { // AND C
                 self.a &= self.c;
@@ -416,9 +497,11 @@ pub const CPU = struct {
                 self.f.n = false;
                 self.f.h = true; // AND always sets H flag
                 self.f.c = false;
+                return 1;
             },
             0x79 => { // LD A, C
                 self.a = self.c;
+                return 1;
             },
             0xEF => { // RST 28h
                 const return_addr = self.pc; // The address of the NEXT instruction
@@ -433,6 +516,7 @@ pub const CPU = struct {
                 self.pc = 0x0028;
 
                 std.debug.print("Restarting at vector 0x0028, return address 0x{X:0>4}\n", .{return_addr});
+                return 4;
             },
             0x87 => { // ADD A, A
                 const a = self.a;
@@ -447,6 +531,7 @@ pub const CPU = struct {
                 self.f.c = (@as(u16, a) + @as(u16, a)) > 0xFF;
 
                 self.a = res;
+                return 1;
             },
             0xE1 => { // POP HL
                 // 1. Pop the Low byte into L
@@ -456,10 +541,12 @@ pub const CPU = struct {
                 // 2. Pop the High byte into H
                 self.h = self.readByte(self.sp);
                 self.sp +%= 1;
+                return 3;
             },
             0x16 => { // LD D, d8
                 const val = self.fetchByte();
                 self.d = val;
+                return 2;
             },
             0x19 => { // ADD HL, DE
                 const hl = self.getHL();
@@ -475,6 +562,7 @@ pub const CPU = struct {
                 // Z is NOT affected
 
                 self.setHL(res);
+                return 2;
             },
             0x5E => { // LD E, (HL)
                 const address = self.getHL();
@@ -665,15 +753,15 @@ pub const CPU = struct {
                 // 3. Mask the flags: only Z, N, H, C (top 4 bits) are kept
                 self.setFlagsFromByte(f_raw & 0xF0);
             },
-            0xCB => try self.decodeCB(),
+            0xCB => self.decodeCB(),
             else => {
-                std.debug.print("CRASH: Unknown Opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ opcode, current_pc });
-                return error.UnknownOpcode;
+                std.debug.print("CRASH: Unknown Opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ opcode, self.pc - 1 });
+                @panic("Unknown Opcode");
             },
         }
     }
 
-    fn decodeCB(self: *CPU) !void {
+    fn decodeCB(self: *CPU) u8 {
         const cb_opcode = self.fetchByte();
         switch (cb_opcode) {
             0x11 => self.rl_r8(&self.c), // Use a pointer to register!
@@ -683,10 +771,11 @@ pub const CPU = struct {
                 self.a &= ~(@as(u8, 1) << 0);
             },
             else => {
-                std.debug.print("CRASH: Unknown CB Opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ cb_opcode, self.pc });
-                return error.UnknownOpcode;
+                std.debug.print("CRASH: Unknown CB Opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ cb_opcode, self.pc - 1 });
+                @panic("Unknown CB Opcode");
             },
         }
+        return 2;
     }
 
     // A generic "BIT" tester for the CB-table

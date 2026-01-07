@@ -21,6 +21,10 @@ pub fn main() !void {
     std.debug.print("ROM Loaded successfully. Starting emulation...\n", .{});
 
     while (true) {
-        try newCpu.step();
+        const cycles = newCpu.step();
+
+        newBus.ppu.tick(cycles, &newBus.if_flag);
+
+        newCpu.handleInterrupts();
     }
 }
