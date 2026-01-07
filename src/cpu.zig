@@ -22,6 +22,7 @@ pub const CPU = struct {
     sp: u16 = 0xFFFE,
     ime: bool = false,
     bus: *Bus, // The CPU just holds a pointer to the Bus
+    fake_ly: u8 = 0,
 
     pub fn init(bus: *Bus) CPU {
         return CPU{ .bus = bus };
@@ -29,6 +30,13 @@ pub const CPU = struct {
 
     // --- Memory Helpers ---
     fn readByte(self: *CPU, addr: u16) u8 {
+        if (addr == 0xFF44) {
+            // Increment every read to simulate time passing
+            self.fake_ly +%= 1;
+            // Real GB LY goes up to 153 then resets to 0
+            if (self.fake_ly > 153) self.fake_ly = 0;
+            return self.fake_ly;
+        }
         return self.bus.read(addr);
     }
 
@@ -61,6 +69,18 @@ pub const CPU = struct {
         const high = @as(u16, self.readByte(self.sp));
         self.sp +%= 1;
         self.pc = (high << 8) | low;
+    }
+
+    fn getDE(self: *CPU) u16 {
+        return (@as(u16, self.d) << 8) | self.e;
+    }
+
+    fn setHL(self: *CPU, val: u16) void {
+        self.h = @truncate(val >> 8);
+        self.l = @truncate(val & 0xFF);
+    }
+    fn getHL(self: *CPU) u16 {
+        return (@as(u16, self.h) << 8) | @as(u16, self.l);
     }
 
     // --- Instruction Methods ---
@@ -386,6 +406,93 @@ pub const CPU = struct {
 
                 std.debug.print("Restarting at vector 0x0028, return address 0x{X:0>4}\n", .{return_addr});
             },
+            0x87 => { // ADD A, A
+                const a = self.a;
+                const res = a +% a;
+
+                // Update Flags
+                self.f.z = (res == 0);
+                self.f.n = false;
+                // Half-Carry: did we carry from bit 3 to bit 4?
+                self.f.h = ((a & 0x0F) + (a & 0x0F)) > 0x0F;
+                // Carry: did we carry from bit 7? (Or simply: was bit 7 set?)
+                self.f.c = (@as(u16, a) + @as(u16, a)) > 0xFF;
+
+                self.a = res;
+            },
+            0xE1 => { // POP HL
+                // 1. Pop the Low byte into L
+                self.l = self.readByte(self.sp);
+                self.sp +%= 1;
+
+                // 2. Pop the High byte into H
+                self.h = self.readByte(self.sp);
+                self.sp +%= 1;
+            },
+            0x16 => { // LD D, d8
+                const val = self.fetchByte();
+                self.d = val;
+            },
+            0x19 => { // ADD HL, DE
+                const hl = self.getHL();
+                const de = self.getDE();
+                const res = hl +% de;
+
+                // Update Flags
+                self.f.n = false;
+                // Half-Carry: Carry from bit 11 to bit 12
+                self.f.h = ((hl & 0x0FFF) + (de & 0x0FFF)) > 0x0FFF;
+                // Carry: Carry from bit 15
+                self.f.c = (@as(u32, hl) + @as(u32, de)) > 0xFFFF;
+                // Z is NOT affected
+
+                self.setHL(res);
+            },
+            0x5E => { // LD E, (HL)
+                const address = self.getHL();
+                self.e = self.readByte(address);
+            },
+            0x46 => {
+                // LD B, (HL)
+                self.b = self.readByte(self.getHL());
+            },
+            0x4E => {
+                // LD C, (HL)
+                self.c = self.readByte(self.getHL());
+            },
+            0x56 => {
+                // LD D, (HL)
+                self.d = self.readByte(self.getHL());
+            },
+            0x66 => {
+                // LD H, (HL)
+                self.h = self.readByte(self.getHL());
+            },
+            0x6E => {
+                // LD L, (HL)
+                self.l = self.readByte(self.getHL());
+            },
+            0x7E => {
+                // LD A, (HL)
+                self.a = self.readByte(self.getHL());
+            },
+            0x23 => { // INC HL
+                const val = self.getHL();
+                self.setHL(val +% 1);
+                // No flags affected
+            },
+            0xD5 => { // PUSH DE
+                // 1. Decrement SP and write High byte (D)
+                self.sp -%= 1;
+                self.writeByte(self.sp, self.d);
+
+                // 2. Decrement SP and write Low byte (E)
+                self.sp -%= 1;
+                self.writeByte(self.sp, self.e);
+            },
+            0xE9 => { // JP (HL)
+                self.pc = self.getHL();
+            },
             0xCB => try self.decodeCB(),
             else => {
                 std.debug.print("CRASH: Unknown Opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ opcode, current_pc });
@@ -400,6 +507,9 @@ pub const CPU = struct {
             0x11 => self.rl_r8(&self.c), // Use a pointer to register!
             0x37 => self.swap_r8(&self.a), // Add this!
             0x7C => self.bit_test(7, self.h),
+            0x87 => { // RES 0, A (Reset bit 0 of Register A)
+                self.a &= ~(@as(u8, 1) << 0);
+            },
             else => {
                 std.debug.print("CRASH: Unknown CB Opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ cb_opcode, self.pc });
                 return error.UnknownOpcode;
