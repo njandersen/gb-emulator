@@ -10,6 +10,8 @@ pub const PPU = struct {
     scy: u8 = 0,
     scx: u8 = 0,
 
+    dot_counter: u32 = 0,
+
     pub fn readRegister(self: *PPU, addr: u16) u8 {
         return switch (addr) {
             0xFF40 => self.lcdc,
