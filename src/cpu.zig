@@ -23,20 +23,586 @@ pub const CPU = struct {
     ime: bool = false,
     bus: *Bus, // The CPU just holds a pointer to the Bus
     fake_ly: u8 = 0,
+    halted: bool = false,
 
     pub fn init(bus: *Bus) CPU {
-        return CPU{ .bus = bus };
+        return CPU{
+            .bus = bus,
+            .a = 0x01, // Post-boot state
+            .f = .{ .z = true, .n = false, .h = true, .c = true },
+            .b = 0x00,
+            .c = 0x13,
+            .d = 0x00,
+            .e = 0xD8,
+            .h = 0x01,
+            .l = 0x4D,
+            .sp = 0xFFFE,
+            .pc = 0x0100,
+        };
     }
 
-    // --- Memory Helpers ---
-    fn readByte(self: *CPU, addr: u16) u8 {
-        if (addr == 0xFF44) {
-            // Increment every read to simulate time passing
-            self.fake_ly +%= 1;
-            // Real GB LY goes up to 153 then resets to 0
-            if (self.fake_ly > 153) self.fake_ly = 0;
-            return self.fake_ly;
+    // ===============================================================================================
+    // --- Main ---
+    // ===============================================================================================
+    pub fn step(self: *CPU) u8 {
+        if (self.pc == 0x02ED) {
+            const ie = self.bus.read(0xFFFF);
+            const if_reg = self.bus.read(0xFF0F);
+            std.debug.print("--- AT 0x02ED --- IME: {} | IE: 0x{X:0>2} | IF: 0x{X:0>2}\n", .{ self.ime, ie, if_reg });
         }
+        if (self.halted) {
+            return 1; // Return 1 M-cycle while asleep
+        }
+        const opcode = self.fetchByte();
+
+        // // Print ALL instructions, not just at specific PC
+        // std.debug.print("PC: 0x{X:0>4} | Op: 0x{X:0>2} | A:{X:0>2} B:{X:0>2} C:{X:0>2} D:{X:0>2} E:{X:0>2} H:{X:0>2} L:{X:0>2} | Z:{} N:{} H:{} C:{}\n", .{ self.pc -% 1, opcode, self.a, self.b, self.c, self.d, self.e, self.h, self.l, self.f.z, self.f.n, self.f.h, self.f.c });
+        return switch (opcode) {
+            // ===============================================================================================
+            // --- CONTROL/MISC ---
+            // ===============================================================================================
+            0x00 => {
+                return 1;
+            }, // NOP
+            0xF3 => {
+                self.ime = false;
+                return 1;
+            }, // DI
+            0xFB => {
+                self.ime = true;
+                return 1;
+            }, // EI
+            0x2F => {
+                self.a = ~self.a;
+                self.f.n = true;
+                self.f.h = true;
+                return 1;
+            }, // CPL
+            0x37 => {
+                self.f.n = false;
+                self.f.h = false;
+                self.f.c = true;
+                return 1;
+            }, // SCF
+
+            // ===============================================================================================
+            // --- 8-BIT ---
+            // ===============================================================================================
+
+            // --- 2. 8-Bit Loads (The BIG cleanup) ---
+            // Groups all LD r, r' including LD r, (HL) and LD (HL), r
+            0x40...0x75, 0x77...0x7F => {
+                const src = self.getReg(@truncate(opcode & 0x07));
+                self.setReg(@truncate((opcode >> 3) & 0x07), src);
+                return if ((opcode & 0x07) == 6 or ((opcode >> 3) & 0x07) == 6) 2 else 1;
+            },
+
+            // --- 8-Bit Immediate Loads (LD r, d8) ---
+            // Pattern: 0x06, 0x0E, 0x16, 0x1E, 0x26, 0x2E, 0x36, 0x3E
+            0x06, 0x0E, 0x16, 0x1E, 0x26, 0x2E, 0x36, 0x3E => {
+                const val = self.fetchByte();
+                const reg_index: u3 = @truncate(opcode >> 3);
+                self.setReg(reg_index, val);
+                return if (reg_index == 6) 3 else 2; // (HL) takes 3 cycles, others take 2
+            },
+
+            // --- 8-Bit Absolute Loads (LD (nn), A and LD A, (nn)) ---
+            0xEA => { // LD (nn), A
+                const addr = self.fetchU16();
+                self.writeByte(addr, self.a);
+                return 4;
+            },
+            0xFA => { // LD A, (nn)
+                const addr = self.fetchU16();
+                self.a = self.readByte(addr);
+                return 4;
+            },
+
+            // --- 8-Bit High RAM Offset Loads (LD (C), A and LD A, (C)) ---
+            0xE2 => { // LD ($FF00+C), A
+                const addr = 0xFF00 + @as(u16, self.c);
+                self.writeByte(addr, self.a);
+                return 2;
+            },
+            0xF2 => { // LD A, ($FF00+C)
+                const addr = 0xFF00 + @as(u16, self.c);
+                self.a = self.readByte(addr);
+                return 2;
+            },
+
+            // --- 8-Bit Indirect Loads (Register as Pointer) ---
+            0x02 => { // LD (BC), A
+                self.writeByte(self.getBC(), self.a);
+                return 2;
+            },
+            0x12 => { // LD (DE), A
+                self.writeByte(self.getDE(), self.a);
+                return 2;
+            },
+            0x0A => { // LD A, (BC)
+                self.a = self.readByte(self.getBC());
+                return 2;
+            },
+            0x1A => { // LD A, (DE)
+                self.a = self.readByte(self.getDE());
+                return 2;
+            },
+
+            // --- 3. 8-Bit Arithmetic Groups ---
+            0x80...0x87 => {
+                self.add_a_r8(self.getReg(@truncate(opcode & 0x07)));
+                return if ((opcode & 0x07) == 6) 2 else 1;
+            },
+            0x88...0x8F => |op| {
+                const reg_idx: u3 = @truncate(op & 0x7);
+                const val = self.getReg(reg_idx);
+                self.adc_a_r8(val);
+                return if (reg_idx == 6) 2 else 1; // (HL) takes 2 cycles, registers take 1
+            },
+            0xA0...0xA7 => {
+                self.and_a_r8(self.getReg(@truncate(opcode & 0x07)));
+                return if ((opcode & 0x07) == 6) 2 else 1;
+            },
+            0xA8...0xAF => {
+                self.xor_a_r8(self.getReg(@truncate(opcode & 0x07)));
+                return if ((opcode & 0x07) == 6) 2 else 1;
+            },
+            0xB0...0xB7 => {
+                self.or_a_r8(self.getReg(@truncate(opcode & 0x07)));
+                return if ((opcode & 0x07) == 6) 2 else 1;
+            },
+            0xB8...0xBF => {
+                self.sub_a_r8(self.getReg(@truncate(opcode & 0x07)));
+                return if ((opcode & 0x07) == 6) 2 else 1;
+            },
+
+            // --- 8-Bit Arithmetic Immediate (op A, d8) ---
+            0xC6 => {
+                self.add_a_r8(self.fetchByte());
+                return 2;
+            }, // ADD A, d8
+            0xCE => { // ADC implementation
+                return 2;
+            }, // ADC A, d8
+            0xD6 => {
+                self.sub_a_r8(self.fetchByte());
+                return 2;
+            }, // SUB d8
+            0xDE => { // SBC implementation
+                return 2;
+            }, // SBC A, d8
+            0xE6 => {
+                self.and_a_r8(self.fetchByte());
+                return 2;
+            }, // AND d8
+            0xEE => {
+                self.xor_a_r8(self.fetchByte());
+                return 2;
+            }, // XOR d8
+            0xF6 => {
+                self.or_a_r8(self.fetchByte());
+                return 2;
+            }, // OR d8
+            0xFE => { // CP d8
+                const val = self.fetchByte();
+                const a = self.a;
+                self.f.z = (a == val);
+                self.f.n = true;
+                self.f.h = (a & 0x0F) < (val & 0x0F);
+                self.f.c = a < val;
+                return 2;
+            },
+
+            // --- 8-Bit HL-Pointer Loads (LD (HL+/-), A and LD A, (HL+/-)) ---
+            0x22 => { // LD (HL+), A
+                const addr = self.getHL();
+                self.writeByte(addr, self.a);
+                self.setHL(addr +% 1);
+                return 2;
+            },
+            0x32 => { // LD (HL-), A
+                const addr = self.getHL();
+                self.writeByte(addr, self.a);
+                self.setHL(addr -% 1);
+                return 2;
+            },
+            0x2A => { // LD A, (HL+)
+                const addr = self.getHL();
+                self.a = self.readByte(addr);
+                self.setHL(addr +% 1);
+                return 2;
+            },
+            0x3A => { // LD A, (HL-)
+                const addr = self.getHL();
+                self.a = self.readByte(addr);
+                self.setHL(addr -% 1);
+                return 2;
+            },
+
+            // --- 8-Bit INC/DEC r8 ---
+            0x04,
+            0x0C,
+            0x14,
+            0x1C,
+            0x24,
+            0x2C,
+            0x34,
+            0x3C, // INC
+            0x05,
+            0x0D,
+            0x15,
+            0x1D,
+            0x25,
+            0x2D,
+            0x35,
+            0x3D, // DEC
+            => |op| {
+                const reg_idx: u3 = @truncate(op >> 3);
+                const old_val = self.getReg(reg_idx);
+                const is_inc = (op & 0x01) == 0;
+
+                const new_val = if (is_inc) old_val +% 1 else old_val -% 1;
+                self.setReg(reg_idx, new_val);
+
+                // Flags
+                self.f.z = (new_val == 0);
+                self.f.n = !is_inc;
+                self.f.h = if (is_inc) (old_val & 0x0F) == 0x0F else (old_val & 0x0F) == 0;
+                // Note: Carry flag is NOT affected
+
+                return if (reg_idx == 6) 3 else 1;
+            },
+
+            // ===============================================================================================
+            // --- 16-BIT ---
+            // ===============================================================================================
+
+            // --- 4. 16-Bit Loads / Arithmetic ---
+            0x01, 0x11, 0x21, 0x31 => { // LD rr, d16
+                const val = self.fetchU16();
+                switch (opcode) {
+                    0x01 => self.setBC(val),
+                    0x11 => self.setDE(val),
+                    0x21 => self.setHL(val),
+                    0x31 => self.sp = val,
+                    else => unreachable,
+                }
+                return 3;
+            },
+            0x09, 0x19, 0x29, 0x39 => { // ADD HL, rr
+                const hl = self.getHL();
+                const rr = switch (opcode) {
+                    0x09 => self.getBC(),
+                    0x19 => self.getDE(),
+                    0x29 => self.getHL(),
+                    0x39 => self.sp,
+                    else => unreachable,
+                };
+                const res = hl +% rr;
+                self.f.n = false;
+                self.f.h = ((hl & 0x0FFF) + (rr & 0x0FFF)) > 0x0FFF;
+                self.f.c = (@as(u32, hl) + @as(u32, rr)) > 0xFFFF;
+                self.setHL(res);
+                return 2;
+            },
+
+            // --- 16-Bit INC/DEC ---
+            0x03,
+            0x13,
+            0x23,
+            0x33, // INC BC, DE, HL, SP
+            0x0B,
+            0x1B,
+            0x2B,
+            0x3B, // DEC BC, DE, HL, SP
+            => |op| {
+                const is_inc = (op & 0x08) == 0;
+                switch (op & 0x30) {
+                    0x00 => if (is_inc) self.setBC(self.getBC() +% 1) else self.setBC(self.getBC() -% 1),
+                    0x10 => if (is_inc) self.setDE(self.getDE() +% 1) else self.setDE(self.getDE() -% 1),
+                    0x20 => if (is_inc) self.setHL(self.getHL() +% 1) else self.setHL(self.getHL() -% 1),
+                    0x30 => {
+                        if (is_inc) self.sp +%= 1 else self.sp -%= 1;
+                    },
+                    else => unreachable,
+                }
+                return 2;
+            },
+
+            // --- 16-bit PUSH (BC, DE, HL, AF) ---
+            0xC5, 0xD5, 0xE5, 0xF5 => |op| {
+                const val = switch (op) {
+                    0xC5 => self.getBC(),
+                    0xD5 => self.getDE(),
+                    0xE5 => self.getHL(),
+                    0xF5 => (@as(u16, self.a) << 8) | @as(u16, self.getFlagsAsByte()),
+                    else => unreachable,
+                };
+                self.push(val);
+                return 4;
+            },
+
+            // --- 16-bit POP (BC, DE, HL, AF) ---
+            0xC1, 0xD1, 0xE1, 0xF1 => |op| {
+                const val = self.pop();
+                switch (op) {
+                    0xC1 => self.setBC(val),
+                    0xD1 => self.setDE(val),
+                    0xE1 => self.setHL(val),
+                    0xF1 => {
+                        self.a = @truncate(val >> 8);
+                        // Crucial: The lower 4 bits of the F register are ALWAYS zero on Game Boy
+                        self.setFlagsFromByte(@truncate(val & 0xF0));
+                    },
+                    else => unreachable,
+                }
+                return 3;
+            },
+
+            // --- 16-Bit Conditional Jumps (JP NZ/Z/NC/C, nn) ---
+            0xC2, 0xCA, 0xD2, 0xDA => {
+                const dest = self.fetchU16();
+                const condition = switch (opcode) {
+                    0xC2 => !self.f.z,
+                    0xCA => self.f.z,
+                    0xD2 => !self.f.c,
+                    0xDA => self.f.c,
+                    else => unreachable,
+                };
+                if (condition) {
+                    self.pc = dest;
+                    return 4;
+                }
+                return 3;
+            },
+
+            // ===============================================================================================
+            // --- JUMPS & CALLS ---
+            // ===============================================================================================
+
+            0xC3 => {
+                self.pc = self.fetchU16();
+                return 4;
+            }, // JP nn
+            0xCD => { // CALL nn
+                const dest = self.fetchU16();
+                self.push(self.pc);
+                self.pc = dest;
+                return 6;
+            },
+            // --- Jump to HL ---
+            0xE9 => {
+                self.pc = self.getHL();
+                return 1;
+            },
+
+            // --- Conditional Calls (CALL NZ, Z, NC, C) ---
+            0xC4, 0xCC, 0xD4, 0xDC => {
+                const dest = self.fetchU16();
+                const condition = switch (opcode) {
+                    0xC4 => !self.f.z,
+                    0xCC => self.f.z,
+                    0xD4 => !self.f.c,
+                    0xDC => self.f.c,
+                    else => unreachable,
+                };
+                if (condition) {
+                    self.push(self.pc);
+                    self.pc = dest;
+                    return 6;
+                }
+                return 3;
+            },
+
+            // --- Relative Jumps (JR) ---
+            0x18 => { // JR s8 (Always jump)
+                const offset = @as(i8, @bitCast(self.fetchByte()));
+                self.pc = self.pc +% @as(u16, @bitCast(@as(i16, offset)));
+                return 3;
+            },
+            0x20, 0x28, 0x30, 0x38 => {
+                const offset = @as(i8, @bitCast(self.fetchByte()));
+                const condition = switch (opcode) {
+                    0x20 => !self.f.z,
+                    0x28 => self.f.z,
+                    0x30 => !self.f.c,
+                    0x38 => self.f.c,
+                    else => unreachable,
+                };
+
+                if (condition) {
+                    // Correct way to add a signed i8 to a u16 in Zig:
+                    const casted_offset = @as(i16, offset);
+                    const new_pc = @as(i32, @intCast(self.pc)) + casted_offset;
+                    self.pc = @as(u16, @intCast(new_pc));
+                    return 3;
+                }
+                return 2;
+            },
+
+            // ===============================================================================================
+            // --- RETURNS ---
+            // ===============================================================================================
+
+            0xC9 => { // RET (Unconditional)
+                self.pc = self.pop();
+                return 4;
+            },
+            0xC0, 0xC8, 0xD0, 0xD8 => { // RET NZ, Z, NC, C
+                const condition = switch (opcode) {
+                    0xC0 => !self.f.z,
+                    0xC8 => self.f.z,
+                    0xD0 => !self.f.c,
+                    0xD8 => self.f.c,
+                    else => unreachable,
+                };
+                if (condition) {
+                    self.pc = self.pop();
+                    return 5; // Conditional return takes more cycles if taken
+                }
+                return 2;
+            },
+            0xD9 => { // RETI (Return from Interrupt)
+                self.pc = self.pop();
+                self.ime = true; // Re-enable interrupts
+                return 4;
+            },
+
+            // ===============================================================================================
+            // --- RESTARTS ---
+            // ===============================================================================================j
+
+            0xC7, 0xCF, 0xD7, 0xDF, 0xE7, 0xEF, 0xF7, 0xFF => |op| {
+                self.push(self.pc);
+                // The jump destination is encoded in bits 3, 4, and 5 of the opcode
+                self.pc = @as(u16, op & 0x38);
+                return 4;
+            },
+
+            // ===============================================================================================
+            // --- MAIN ROTATES ---
+            // ===============================================================================================
+            0x07 => { // RLCA
+                self.a = self.rlc_logic(self.a);
+                self.f.z = false; // IMPORTANT: Main table rotates always clear Z
+                return 1;
+            },
+            0x0F => { // RRCA
+                self.a = self.rrc_logic(self.a);
+                self.f.z = false;
+                return 1;
+            },
+            0x17 => { // RLA
+                self.a = self.rl_logic(self.a);
+                self.f.z = false;
+                return 1;
+            },
+            0x1F => { // RRA
+                self.a = self.rr_logic(self.a);
+                self.f.z = false;
+                return 1;
+            },
+
+            // ===============================================================================================
+            // --- REST/MISC ---
+            // ===============================================================================================
+
+            0xE0 => {
+                self.writeByte(0xFF00 + @as(u16, self.fetchByte()), self.a);
+                return 3;
+            }, // LDH (n), A
+            0xF0 => {
+                const port_byte = self.fetchByte();
+                const target_addr = 0xFF00 + @as(u16, port_byte);
+                const result = self.readByte(target_addr);
+
+                // NO IF STATEMENT - PRINT EVERYTHING
+                std.debug.print("!!! LDH EXECUTION !!! PC: 0x{X:0>4} | Port: 0x{X:0>2} | Val: {d}\n", .{ self.pc - 2, port_byte, result });
+
+                self.a = result;
+                return 3;
+            },
+            0x27 => { // DAA
+                self.daa_logic();
+                return 1;
+            },
+            0x76 => { // HALT
+                self.halted = true;
+                return 1;
+            },
+            0xCB => self.decodeCB(),
+
+            else => {
+                std.debug.print("CRASH: Unknown Opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ opcode, self.pc - 1 });
+                @panic("Unknown Opcode");
+            },
+        };
+    }
+
+    fn decodeCB(self: *CPU) u8 {
+        const cb_opcode = self.fetchByte();
+        const bit: u3 = @truncate((cb_opcode >> 3) & 0x7);
+        const reg_idx: u3 = @truncate(cb_opcode & 0x7);
+
+        return switch (cb_opcode) {
+            // --- 0x40 - 0x7F: BIT n, r ---
+            0x40...0x7F => {
+                const val = self.getReg(reg_idx);
+                self.f.z = (val & (@as(u8, 1) << bit)) == 0;
+                self.f.n = false;
+                self.f.h = true;
+                // Carry flag is not affected
+                return if (reg_idx == 6) 3 else 2;
+            },
+
+            // --- 0x80 - 0xBF: RES n, r (Reset bit) ---
+            0x80...0xBF => {
+                var val = self.getReg(reg_idx);
+                val &= ~(@as(u8, 1) << bit);
+                self.setReg(reg_idx, val);
+                return if (reg_idx == 6) 4 else 2;
+            },
+
+            // --- 0xC0 - 0xFF: SET n, r (Set bit) ---
+            0xC0...0xFF => {
+                var val = self.getReg(reg_idx);
+                val |= (@as(u8, 1) << bit);
+                self.setReg(reg_idx, val);
+                return if (reg_idx == 6) 4 else 2;
+            },
+
+            // --- 0x00 - 0x3F: Rotates and Shifts ---
+            0x00...0x3F => |op| {
+                const operation: u3 = @truncate(op >> 3);
+                var val = self.getReg(reg_idx);
+
+                switch (operation) {
+                    0 => val = self.rlc_logic(val), // RLC
+                    1 => val = self.rrc_logic(val), // RRC
+                    2 => val = self.rl_logic(val), // RL
+                    3 => val = self.rr_logic(val), // RR
+                    4 => val = self.sla_logic(val), // SLA
+                    5 => val = self.sra_logic(val), // SRA
+                    6 => val = self.swap_logic(val), // SWAP
+                    7 => val = self.srl_logic(val), // SRL
+                }
+
+                self.setReg(reg_idx, val);
+                return if (reg_idx == 6) 4 else 2;
+            },
+        };
+    }
+    // ===============================================================================================
+    // --- Memory Helpers ---
+    // ===============================================================================================
+    fn readByte(self: *CPU, addr: u16) u8 {
+        // if (addr == 0xFF44) {
+        //     // Increment every read to simulate time passing
+        //     self.fake_ly +%= 1;
+        //     // Real GB LY goes up to 153 then resets to 0
+        //     if (self.fake_ly > 153) self.fake_ly = 0;
+        //     return self.fake_ly;
+        // }
         return self.bus.read(addr);
     }
 
@@ -55,12 +621,75 @@ pub const CPU = struct {
         self.pc +%= 2;
         return (high << 8) | low;
     }
+
+    // ===============================================================================================
+    // --- REGISTER & MEMORY ACCESS ---
+    // ===============================================================================================
     fn getBC(self: *CPU) u16 {
-        return (@as(u16, self.b) << 8) | @as(u16, self.c);
+        return (@as(u16, self.b) << 8) | self.c;
     }
-    fn setBC(self: *CPU, value: u16) void {
-        self.b = @truncate(value >> 8);
-        self.c = @truncate(value & 0xFF);
+    fn getDE(self: *CPU) u16 {
+        return (@as(u16, self.d) << 8) | self.e;
+    }
+    fn getHL(self: *CPU) u16 {
+        return (@as(u16, self.h) << 8) | self.l;
+    }
+
+    fn setBC(self: *CPU, val: u16) void {
+        self.b = @truncate(val >> 8);
+        self.c = @truncate(val & 0xFF);
+    }
+    fn setDE(self: *CPU, val: u16) void {
+        self.d = @truncate(val >> 8);
+        self.e = @truncate(val & 0xFF);
+    }
+    fn setHL(self: *CPU, val: u16) void {
+        self.h = @truncate(val >> 8);
+        self.l = @truncate(val & 0xFF);
+    }
+
+    fn getReg(self: *CPU, index: u3) u8 {
+        return switch (index) {
+            0 => self.b,
+            1 => self.c,
+            2 => self.d,
+            3 => self.e,
+            4 => self.h,
+            5 => self.l,
+            6 => self.readByte(self.getHL()),
+            7 => self.a,
+        };
+    }
+
+    fn setReg(self: *CPU, index: u3, val: u8) void {
+        switch (index) {
+            0 => self.b = val,
+            1 => self.c = val,
+            2 => self.d = val,
+            3 => self.e = val,
+            4 => self.h = val,
+            5 => self.l = val,
+            6 => self.writeByte(self.getHL(), val),
+            7 => self.a = val,
+        }
+    }
+
+    // ===============================================================================================
+    // --- STACK OPERATIONS ---
+    // ===============================================================================================
+    fn push(self: *CPU, value: u16) void {
+        self.sp -%= 1;
+        self.writeByte(self.sp, @truncate(value >> 8));
+        self.sp -%= 1;
+        self.writeByte(self.sp, @truncate(value & 0xFF));
+    }
+
+    fn pop(self: *CPU) u16 {
+        const low = @as(u16, self.readByte(self.sp));
+        self.sp +%= 1;
+        const high = @as(u16, self.readByte(self.sp));
+        self.sp +%= 1;
+        return (high << 8) | low;
     }
 
     fn ret(self: *CPU) void {
@@ -71,22 +700,9 @@ pub const CPU = struct {
         self.pc = (high << 8) | low;
     }
 
-    fn getDE(self: *CPU) u16 {
-        return (@as(u16, self.d) << 8) | self.e;
-    }
-    fn setDE(self: *CPU, val: u16) void {
-        self.d = @truncate(val >> 8);
-        self.e = @truncate(val & 0xFF);
-    }
-
-    fn setHL(self: *CPU, val: u16) void {
-        self.h = @truncate(val >> 8);
-        self.l = @truncate(val & 0xFF);
-    }
-    fn getHL(self: *CPU) u16 {
-        return (@as(u16, self.h) << 8) | @as(u16, self.l);
-    }
-
+    // ===============================================================================================
+    // --- FLAG OPERATIONS ---
+    // ===============================================================================================
     fn getFlagsAsByte(self: *CPU) u8 {
         var res: u8 = 0;
         if (self.f.z) res |= 0x80;
@@ -96,39 +712,6 @@ pub const CPU = struct {
         return res;
     }
 
-    // --- Instruction Methods ---
-    fn push(self: *CPU, value: u16) void {
-        self.sp -%= 1;
-        self.writeByte(self.sp, @truncate(value >> 8));
-        self.sp -%= 1;
-        self.writeByte(self.sp, @truncate(value & 0xFF));
-    }
-
-    fn rl_r8(self: *CPU, reg: *u8) void {
-        const old_carry: u8 = if (self.f.c) 1 else 0;
-        const msb = (reg.* >> 7) & 1;
-
-        // Shift left and bring in the old carry to bit 0
-        reg.* = (reg.* << 1) | old_carry;
-
-        // Update flags
-        self.f.z = (reg.* == 0);
-        self.f.n = false;
-        self.f.h = false;
-        self.f.c = (msb == 1);
-    }
-
-    fn swap_r8(self: *CPU, reg: *u8) void {
-        const low = reg.* & 0x0F;
-        const high = (reg.* & 0xF0) >> 4;
-        reg.* = (low << 4) | high;
-
-        self.f.z = (reg.* == 0);
-        self.f.n = false;
-        self.f.h = false;
-        self.f.c = false;
-    }
-
     fn setFlagsFromByte(self: *CPU, byte: u8) void {
         self.f.z = (byte & 0x80) != 0;
         self.f.n = (byte & 0x40) != 0;
@@ -136,696 +719,215 @@ pub const CPU = struct {
         self.f.c = (byte & 0x10) != 0;
     }
 
-    //===============================================================================================
-    // Interrupts
-    //===============================================================================================
-    pub fn handleInterrupts(self: *CPU) void {
-        if (!self.ime) return; // Master enable must be on
+    // ===============================================================================================
+    // --- 8-BIT ARITHMETIC LOGIC (ALU) ---
+    // ===============================================================================================
+    fn add_a_r8(self: *CPU, val: u8) void {
+        const a = self.a;
+        const res = a +% val;
+        self.f.z = (res == 0);
+        self.f.n = false;
+        self.f.h = ((a & 0x0F) + (val & 0x0F)) > 0x0F;
+        self.f.c = (@as(u16, a) + @as(u16, val)) > 0xFF;
+        self.a = res;
+    }
 
-        const ie = self.readByte(0xFFFF); // Interrupt Enable
-        const if_reg = self.readByte(0xFF0F); // Interrupt Flag
-        const pending = ie & if_reg;
+    fn adc_a_r8(self: *CPU, val: u8) void {
+        const a = self.a;
+        const c: u8 = if (self.f.c) 1 else 0;
+        const res = a +% val +% c;
+        self.f.z = (res == 0);
+        self.f.n = false;
+        self.f.h = (a & 0x0F) + (val & 0x0F) + c > 0x0F;
+        self.f.c = @as(u16, a) + @as(u16, val) + @as(u16, c) > 0xFF;
+        self.a = res;
+    }
 
-        if (pending > 0) {
-            // V-Blank has highest priority (Bit 0)
-            if (pending & 0x01 != 0) {
-                self.serviceInterrupt(0, 0x0040);
+    fn sub_a_r8(self: *CPU, val: u8) void {
+        const a = self.a;
+        const res = a -% val;
+        self.f.z = (res == 0);
+        self.f.n = true;
+        self.f.h = (a & 0x0F) < (val & 0x0F);
+        self.f.c = a < val;
+        self.a = res;
+    }
+
+    fn sbc_a_r8(self: *CPU, val: u8) void {
+        const a = self.a;
+        const c: u8 = if (self.f.c) 1 else 0;
+        const res = a -% val -% c;
+        self.f.z = (res == 0);
+        self.f.n = true;
+        self.f.h = @as(i32, a & 0x0F) - @as(i32, val & 0x0F) - @as(i32, c) < 0;
+        self.f.c = @as(i32, a) - @as(i32, val) - @as(i32, c) < 0;
+        self.a = res;
+    }
+
+    fn and_a_r8(self: *CPU, val: u8) void {
+        self.a &= val;
+        self.f = .{ .z = (self.a == 0), .n = false, .h = true, .c = false };
+    }
+
+    fn xor_a_r8(self: *CPU, val: u8) void {
+        self.a ^= val;
+        self.f = .{ .z = (self.a == 0), .n = false, .h = false, .c = false };
+    }
+
+    fn or_a_r8(self: *CPU, val: u8) void {
+        self.a |= val;
+        self.f = .{ .z = (self.a == 0), .n = false, .h = false, .c = false };
+    }
+
+    fn cp_a_r8(self: *CPU, val: u8) void {
+        const a = self.a;
+        self.f.z = (a == val);
+        self.f.n = true;
+        self.f.h = (a & 0x0F) < (val & 0x0F);
+        self.f.c = a < val;
+    }
+    fn daa_logic(self: *CPU) void {
+        var a = @as(u16, self.a);
+
+        if (!self.f.n) {
+            // After an addition, adjust if carry occurred or if digit > 9
+            if (self.f.h or (a & 0x0F) > 0x09) {
+                a += 0x06;
             }
-            // ... handle other bits (LCD Stat, Timer, etc.)
-        }
-    }
-
-    fn serviceInterrupt(self: *CPU, bit: u3, vector: u16) void {
-        self.ime = false; // Disable interrupts
-
-        // Clear the specific bit we are servicing in IF
-        var if_reg = self.readByte(0xFF0F);
-        if_reg &= ~(@as(u8, 1) << bit);
-        self.writeByte(0xFF0F, if_reg);
-
-        // Push PC to stack
-        self.sp -%= 1;
-        self.writeByte(self.sp, @as(u8, @truncate(self.pc >> 8)));
-        self.sp -%= 1;
-        self.writeByte(self.sp, @as(u8, @truncate(self.pc & 0xFF)));
-
-        // Jump to the interrupt vector
-        self.pc = vector;
-    }
-
-    //===============================================================================================
-    // Main Step
-    //===============================================================================================
-    pub fn step(self: *CPU) u8 {
-        const opcode = self.fetchByte();
-        if (self.pc == 0x27AD) { // 0x27AD is the instruction AFTER the loop
-            std.debug.print("I FINALLY ESCAPED THE LOOP! BC is now: {X:0>4}\n", .{self.getBC()});
-        }
-
-        return switch (opcode) {
-            0x00 => {
-                // NOP
-                return 1;
-            },
-            0x31 => {
-                // LD SP, d16 (3 bytes: opcode + 2 bytes for address)
-                self.sp = self.fetchU16();
-                return 3;
-            },
-            0xAF => { // XOR A (1 byte)
-                // This is a common trick to set Register A to 0.
-                // Logic: A XOR A is always 0.
-                self.a = self.a ^ self.a;
-                // Set F register directly using the struct
-                // We overwrite all flags because XOR clears N, H, and C
-                self.f = .{
-                    .z = true,
-                    .n = false,
-                    .h = false,
-                    .c = false,
-                };
-
-                return 1;
-            },
-            0x21 => { // LD HL, d16 (3 bytes)
-                // Load an immediate 16-bit value into the H and L registers
-                const val = self.fetchU16();
-                self.h = @truncate(val >> 8);
-                self.l = @truncate(val & 0xFF);
-                return 3;
-            },
-            0xC3 => { // JP nn (jump to 16-bit address)
-                self.pc = self.fetchU16();
-                return 4;
-            },
-            0x0E => { // LD C, d8
-                self.c = self.fetchByte();
-                return 2;
-            },
-            0x06 => { // LD B, d8
-                self.b = self.fetchByte();
-                return 2;
-            },
-            0x32 => { // LD (HL-), A (1 byte)
-                // 1. Get the 16-bit address currently held by H and L
-                const hl = (@as(u16, self.h) << 8) | self.l;
-                // 2. Write the value of Register A to that memory address
-                self.writeByte(hl, self.a);
-                // 3. Decrement the HL pair
-                const new_hl = hl -% 1; // -% is "Wrapping Subtraction" in Zig
-                self.h = @as(u8, @truncate(new_hl >> 8));
-                self.l = @as(u8, @truncate(new_hl & 0xFF));
-                return 2;
-            },
-            0x05 => { // DEC B (1 byte)
-                self.b = self.b -% 1;
-                // Set the "notes" for the next instruction
-                self.f.z = (self.b == 0); // Is it zero?
-                self.f.n = true; // Yes, we subtracted.
-
-                return 1;
-            },
-            0x20 => { // JR NZ, r8
-                const offset = @as(i8, @bitCast(self.fetchByte()));
-                if (!self.f.z) {
-                    // Use wrapping addition to handle the jump
-                    const current_pc_i16 = @as(i16, @bitCast(self.pc));
-                    const new_pc_i16 = current_pc_i16 + offset;
-                    self.pc = @as(u16, @bitCast(new_pc_i16));
-                    return 3;
-                }
-                return 2;
-            },
-            0x0D => {
-                // DEC C (1 byte)
-                self.c = self.c -% 1;
-                // Set the "notes" for the next instruction
-                self.f.z = (self.c == 0); // Is it zero?
-                self.f.n = true; // Yes, we subtracted.
-                return 1;
-            },
-            0x3E => {
-                // LD A, d8 (2 bytes)
-                self.a = self.fetchByte();
-                return 2;
-            },
-            0xF3 => { // DI (1 byte)
-                self.ime = false;
-                return 1;
-            },
-            0xE0 => { // LDH (a8), A (2 bytes)
-                const offset = self.fetchByte();
-                const address = 0xFF00 + @as(u16, offset);
-                self.writeByte(address, self.a);
-                return 3;
-            },
-            0xF0 => { // LDH A, (a8)
-                const offset = self.fetchByte();
-                const address = 0xFF00 + @as(u16, offset);
-                // Read from the bus and put it in A
-                self.a = self.readByte(address);
-                // Ready for next opcode
-                return 3;
-            },
-            0xFE => { // CP d8
-                const value = self.fetchByte();
-
-                // Z: Set if A == value (result is 0)
-                self.f.z = (self.a == value);
-
-                // N: Always set for CP (it is a subtraction)
-                self.f.n = true;
-
-                // H: Set if there was no borrow from bit 4
-                // (Calculation: (A & 0x0F) < (value & 0x0F))
-                self.f.h = (self.a & 0x0F) < (value & 0x0F);
-
-                // C: Set if A < value (a "borrow" occurred)
-                self.f.c = self.a < value;
-                return 2;
-            },
-            0x36 => { // LD (HL), d8
-                const value = self.fetchByte();
-                // Get the address from HL
-                const hl = (@as(u16, self.h) << 8) | self.l;
-                // Write the value to that address
-                self.writeByte(hl, value);
-                // PC is already handled by fetchByte
-                return 3;
-            },
-            0xEA => { // LD (a16), A
-                // Use your helper to grab the next two bytes as a u16
-                const address = self.fetchU16();
-                // Pour the value of A into that specific bucket
-                self.writeByte(address, self.a);
-
-                // No pc += 3 needed because fetchU16 handles the movement!
-                return 4;
-            },
-            0x77 => { // LD (HL), A
-                const hl = (@as(u16, self.h) << 8) | self.l;
-                self.writeByte(hl, self.a);
-                return 2;
-            },
-            0x2A => { // LD A, (HL+)
-                const hl = (@as(u16, self.h) << 8) | self.l;
-                // 1. Get the data from memory and put it in A
-                self.a = self.readByte(hl);
-                // 2. Increment the HL pointer
-                const new_hl = hl +% 1;
-                self.h = @as(u8, @truncate(new_hl >> 8));
-                self.l = @as(u8, @truncate(new_hl & 0xFF));
-                // PC was already moved by the fetchByte at the start of step()
-                return 2;
-            },
-            0xE2 => { // LD (C), A
-                const address = 0xFF00 + @as(u16, self.c);
-                self.writeByte(address, self.a);
-                return 2;
-            },
-            0x0C => { // INC C
-                const old_val = self.c;
-                self.c = self.c +% 1;
-                self.f.z = (self.c == 0);
-                self.f.n = false;
-                // Half-carry: did bit 3 overflow?
-                self.f.h = (old_val & 0x0F) == 0x0F;
-                // Note: Carry flag (C) is NOT affected by INC instructions!
-                return 1;
-            },
-            0xCD => { // CALL nn
-                const target_addr = self.fetchU16();
-                const return_addr = self.pc;
-
-                // Push High Byte
-                self.sp -%= 1;
-                self.writeByte(self.sp, @truncate(return_addr >> 8));
-
-                // Push Low Byte
-                self.sp -%= 1;
-                self.writeByte(self.sp, @truncate(return_addr & 0xFF));
-
-                self.pc = target_addr;
-                std.debug.print("Calling subroutine at 0x{X:0>4}, return address 0x{X:0>4}\n", .{ target_addr, return_addr });
-                return 6;
-            },
-            0x01 => { // LD BC, d16
-                const value = self.fetchU16();
-                self.setBC(value);
-                // PC is now at 0x279B
-                return 3;
-            },
-            0x0B => { // DEC BC
-                const val = self.getBC();
-                self.setBC(val -% 1); // Use wrapping subtraction
-                // No flags are changed!
-                return 2;
-            },
-            0x78 => { // LD A, B
-                self.a = self.b;
-                return 1;
-            },
-            0xB1 => { // OR C
-                self.a |= self.c;
-
-                // Update flags
-                self.f.z = (self.a == 0);
-                self.f.n = false;
-                self.f.h = false;
-                self.f.c = false;
-                return 1;
-            },
-            0xC9 => { // RET
-                // 1. Pop the Low Byte
-                const low = @as(u16, self.readByte(self.sp));
-                self.sp +%= 1;
-
-                // 2. Pop the High Byte
-                const high = @as(u16, self.readByte(self.sp));
-                self.sp +%= 1;
-
-                // 3. Jump back home!
-                self.pc = (high << 8) | low;
-
-                std.debug.print("Returning from subroutine to 0x{X:0>4}\n", .{self.pc});
-                return 4;
-            },
-            0xFB => { // EI
-                // For a basic emulator, we can just set it to true.
-                self.ime = true;
-                return 1;
-            },
-            0x2F => {
-                // CPL
-                self.a = ~self.a; // ~ bitwise NOT operator
-                self.f.n = true;
-                self.f.h = true;
-                return 1;
-            },
-            0xE6 => { // AND d8
-                const mask = self.fetchByte();
-                self.a &= mask;
-
-                // Update flags
-                self.f.z = (self.a == 0);
-                self.f.n = false;
-                self.f.h = true; // Yes, H is always true for AND!
-                self.f.c = false;
-                return 2;
-            },
-            0x37 => { // SCF (Set Carry Flag)
-                self.f.n = false;
-                self.f.h = false;
+            if (self.f.c or a > 0x9F) {
+                a += 0x60;
                 self.f.c = true;
-                // Note: Z is NOT affected by SCF
-                return 1;
-            },
-            0x47 => { // LD B, A
-                self.b = self.a;
-                return 1;
-            },
-            0x4F => {
-                // LD C, A
-                self.c = self.a;
-                return 1;
-            },
-            0x57 => {
-                // LD D, A
-                self.d = self.a;
-                return 1;
-            },
-            0x5F => {
-                // LD E, A
-                self.e = self.a;
-                return 1;
-            },
-            0x67 => {
-                // LD H, A
-                self.h = self.a;
-                return 1;
-            },
-            0x6F => {
-                // LD L, A
-                self.l = self.a;
-                return 1;
-            },
-            0xB0 => { // OR B
-                self.a |= self.b;
-
-                // Update Flags
-                self.f.z = (self.a == 0);
-                self.f.n = false;
-                self.f.h = false;
-                self.f.c = false;
-                return 1;
-            },
-            0xA9 => { // XOR C
-                self.a ^= self.c;
-
-                // Update Flags
-                self.f.z = (self.a == 0);
-                self.f.n = false;
-                self.f.h = false;
-                self.f.c = false;
-                return 1;
-            },
-            0xA1 => { // AND C
-                self.a &= self.c;
-
-                // Update Flags
-                self.f.z = (self.a == 0);
-                self.f.n = false;
-                self.f.h = true; // AND always sets H flag
-                self.f.c = false;
-                return 1;
-            },
-            0x79 => { // LD A, C
-                self.a = self.c;
-                return 1;
-            },
-            0xEF => { // RST 28h
-                const return_addr = self.pc; // The address of the NEXT instruction
-
-                // Push return address onto the stack (High byte then Low byte)
-                self.sp -%= 1;
-                self.writeByte(self.sp, @truncate(return_addr >> 8));
-                self.sp -%= 1;
-                self.writeByte(self.sp, @truncate(return_addr & 0xFF));
-
-                // Jump to the fixed vector address
-                self.pc = 0x0028;
-
-                std.debug.print("Restarting at vector 0x0028, return address 0x{X:0>4}\n", .{return_addr});
-                return 4;
-            },
-            0x87 => { // ADD A, A
-                const a = self.a;
-                const res = a +% a;
-
-                // Update Flags
-                self.f.z = (res == 0);
-                self.f.n = false;
-                // Half-Carry: did we carry from bit 3 to bit 4?
-                self.f.h = ((a & 0x0F) + (a & 0x0F)) > 0x0F;
-                // Carry: did we carry from bit 7? (Or simply: was bit 7 set?)
-                self.f.c = (@as(u16, a) + @as(u16, a)) > 0xFF;
-
-                self.a = res;
-                return 1;
-            },
-            0xE1 => { // POP HL
-                // 1. Pop the Low byte into L
-                self.l = self.readByte(self.sp);
-                self.sp +%= 1;
-
-                // 2. Pop the High byte into H
-                self.h = self.readByte(self.sp);
-                self.sp +%= 1;
-                return 3;
-            },
-            0x16 => { // LD D, d8
-                const val = self.fetchByte();
-                self.d = val;
-                return 2;
-            },
-            0x19 => { // ADD HL, DE
-                const hl = self.getHL();
-                const de = self.getDE();
-                const res = hl +% de;
-
-                // Update Flags
-                self.f.n = false;
-                // Half-Carry: Carry from bit 11 to bit 12
-                self.f.h = ((hl & 0x0FFF) + (de & 0x0FFF)) > 0x0FFF;
-                // Carry: Carry from bit 15
-                self.f.c = (@as(u32, hl) + @as(u32, de)) > 0xFFFF;
-                // Z is NOT affected
-
-                self.setHL(res);
-                return 2;
-            },
-            0x5E => { // LD E, (HL)
-                const address = self.getHL();
-                self.e = self.readByte(address);
-                return 2;
-            },
-            0x46 => {
-                // LD B, (HL)
-                self.b = self.readByte(self.getHL());
-                return 2;
-            },
-            0x4E => {
-                // LD C, (HL)
-                self.c = self.readByte(self.getHL());
-                return 2;
-            },
-            0x56 => {
-                // LD D, (HL)
-                self.d = self.readByte(self.getHL());
-                return 2;
-            },
-            0x66 => {
-                // LD H, (HL)
-                self.h = self.readByte(self.getHL());
-                return 2;
-            },
-            0x6E => {
-                // LD L, (HL)
-                self.l = self.readByte(self.getHL());
-                return 2;
-            },
-            0x7E => {
-                // LD A, (HL)
-                self.a = self.readByte(self.getHL());
-                return 2;
-            },
-            0x23 => { // INC HL
-                const val = self.getHL();
-                self.setHL(val +% 1);
-                // No flags affected
-                return 2;
-            },
-            0xD5 => { // PUSH DE
-                // 1. Decrement SP and write High byte (D)
-                self.sp -%= 1;
-                self.writeByte(self.sp, self.d);
-
-                // 2. Decrement SP and write Low byte (E)
-                self.sp -%= 1;
-                self.writeByte(self.sp, self.e);
-                return 4;
-            },
-            0xE9 => { // JP (HL)
-                self.pc = self.getHL();
-                return 1;
-            },
-            0x11 => { // LD DE, d16
-                const low = self.fetchByte();
-                const high = self.fetchByte();
-                self.e = low;
-                self.d = high;
-                return 3;
-            },
-            0x12 => { // LD (DE), A
-                const address = self.getDE();
-                self.writeByte(address, self.a);
-                return 2;
-            },
-            0x02 => {
-                // LD (BC), A
-                const addr = self.getBC();
-                self.writeByte(addr, self.a);
-                return 2;
-            },
-            0x13 => {
-                // INC DE
-                const val = self.getDE();
-                self.setDE(val +% 1);
-                return 2;
-            },
-            0xE5 => {
-                // PUSH HL
-                // 1. Decrement SP and write High byte (H)
-                self.sp -%= 1;
-                self.writeByte(self.sp, self.h);
-
-                // 2. Decrement SP and write Low byte (L)
-                self.sp -%= 1;
-                self.writeByte(self.sp, self.l);
-                return 4;
-            },
-            0x1A => {
-                // LD A, (DE)
-                self.a = self.readByte(self.getDE());
-                return 2;
-            },
-            0x22 => { // LD (HL+), A
-                const addr = self.getHL();
-                self.writeByte(addr, self.a);
-                self.setHL(addr +% 1);
-                return 2;
-            },
-            0xD1 => {
-                // POP DE
-                self.e = self.readByte(self.sp);
-                self.sp +%= 1;
-
-                self.d = self.readByte(self.sp);
-                self.sp +%= 1;
-                return 3;
-            },
-            0x7C => {
-                // LD A, H
-                self.a = self.h;
-                return 1;
-            },
-            0xF5 => {
-                // PUSH AF
-                self.sp -%= 1;
-                self.writeByte(self.sp, self.a);
-
-                self.sp -%= 1;
-                self.writeByte(self.sp, self.getFlagsAsByte()); // Low byte (F)
-
-                return 4;
-            },
-            0xC5 => {
-                // PUSH BC
-                self.sp -%= 1;
-                self.writeByte(self.sp, self.b);
-
-                self.sp -%= 1;
-                self.writeByte(self.sp, self.c);
-                return 4;
-            },
-            0xFA => { // LD A, (nn)
-                const addr = self.fetchU16();
-                self.a = self.readByte(addr);
-                return 4;
-            },
-            0x28 => { // JR Z, r8
-                const offset = @as(i8, @bitCast(self.fetchByte()));
-                if (self.f.z) {
-                    // Only jump if Zero flag is true
-                    self.pc = @as(u16, @bitCast(@as(i16, @intCast(self.pc)) + offset));
-                    return 3;
-                }
-
-                return 2;
-            },
-            0xA7 => {
-                // AND A
-                self.a &= self.a;
-
-                // Update Flags
-                self.f.z = (self.a == 0);
-                self.f.n = false;
-                self.f.h = true; // AND always sets H flag
-                self.f.c = false;
-                return 1;
-            },
-            0x1C => {
-                // INC E
-                const old_val = self.e;
-                self.e = self.e +% 1;
-                self.f.z = (self.e == 0);
-                self.f.n = false;
-                // Half-carry: did bit 3 overflow?
-                self.f.h = (old_val & 0x0F) == 0x0F;
-                // Note: Carry flag (C) is NOT affected by INC instructions!
-                return 1;
-            },
-            0xCA => {
-                // JP Z, a16
-                const low = self.fetchByte();
-                const high = self.fetchByte();
-                const address = (@as(u16, high) << 8) | low;
-
-                if (self.f.z) {
-                    self.pc = address;
-                    return 4;
-                }
-                return 3;
-            },
-            0xC8 => {
-                // RET Z
-                if (self.f.z) {
-                    const low = self.readByte(self.sp);
-                    self.sp +%= 1;
-                    const high = self.readByte(self.sp);
-                    self.sp +%= 1;
-                    self.pc = (@as(u16, high) << 8) | low;
-                    return 5;
-                }
-                return 2;
-            },
-            0x18 => { // JR s8
-                const offset = @as(i8, @bitCast(self.fetchByte()));
-                // We cast to i16 to handle the signed math before putting it back into the u16 PC
-                const new_pc = @as(i16, @intCast(self.pc)) + offset;
-                self.pc = @as(u16, @bitCast(new_pc));
-                return 3;
-            },
-            0xC1 => {
-                // POP BC
-                self.c = self.readByte(self.sp);
-                self.sp +%= 1;
-
-                self.b = self.readByte(self.sp);
-                self.sp +%= 1;
-                return 3;
-            },
-            0xF1 => { // POP AF
-                // 1. Pop the Low byte (Flags)
-                const f_raw = self.readByte(self.sp);
-                self.sp +%= 1;
-
-                // 2. Pop the High byte (Accumulator)
-                self.a = self.readByte(self.sp);
-                self.sp +%= 1;
-
-                // 3. Mask the flags: only Z, N, H, C (top 4 bits) are kept
-                self.setFlagsFromByte(f_raw & 0xF0);
-                return 3;
-            },
-            0xCB => self.decodeCB(),
-            else => {
-                std.debug.print("CRASH: Unknown Opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ opcode, self.pc - 1 });
-                @panic("Unknown Opcode");
-            },
-        };
-    }
-
-    fn decodeCB(self: *CPU) u8 {
-        const cb_opcode = self.fetchByte();
-        switch (cb_opcode) {
-            0x11 => {
-                self.rl_r8(&self.c);
-                return 2;
-            }, // Use a pointer to register!
-            0x37 => {
-                self.swap_r8(&self.a);
-                return 2;
-            }, // Add this!
-            0x7C => {
-                self.bit_test(7, self.h);
-                return 2;
-            },
-            0x87 => { // RES 0, A (Reset bit 0 of Register A)
-                self.a &= ~(@as(u8, 1) << 0);
-                return 2;
-            },
-            else => {
-                std.debug.print("CRASH: Unknown CB Opcode 0x{X:0>2} at PC 0x{X:0>4}\n", .{ cb_opcode, self.pc - 1 });
-                @panic("Unknown CB Opcode");
-            },
+            }
+        } else {
+            // After a subtraction, adjust if carry occurred
+            if (self.f.h) {
+                a = (a -% 0x06) & 0xFF;
+            }
+            if (self.f.c) {
+                a = (a -% 0x60) & 0xFF;
+            }
         }
+
+        self.a = @truncate(a);
+        self.f.z = (self.a == 0);
+        self.f.h = false;
     }
 
-    // A generic "BIT" tester for the CB-table
+    // ===============================================================================================
+    // --- BITWISE / SHIFT / ROTATE LOGIC ---
+    // ===============================================================================================
+    fn rlc_logic(self: *CPU, val: u8) u8 {
+        const msb = (val & 0x80) != 0;
+        const res = (val << 1) | (if (msb) @as(u8, 1) else 0);
+        self.f = .{ .z = (res == 0), .n = false, .h = false, .c = msb };
+        return res;
+    }
+
+    fn rrc_logic(self: *CPU, val: u8) u8 {
+        const lsb = (val & 0x01) != 0;
+        const res = (val >> 1) | (if (lsb) @as(u8, 0x80) else 0);
+        self.f = .{ .z = (res == 0), .n = false, .h = false, .c = lsb };
+        return res;
+    }
+
+    fn rl_logic(self: *CPU, val: u8) u8 {
+        const msb = (val & 0x80) != 0;
+        const res = (val << 1) | (if (self.f.c) @as(u8, 1) else 0);
+        self.f = .{ .z = (res == 0), .n = false, .h = false, .c = msb };
+        return res;
+    }
+
+    fn rr_logic(self: *CPU, val: u8) u8 {
+        const lsb = (val & 0x01) != 0;
+        const res = (val >> 1) | (if (self.f.c) @as(u8, 0x80) else 0);
+        self.f = .{ .z = (res == 0), .n = false, .h = false, .c = lsb };
+        return res;
+    }
+
+    fn sla_logic(self: *CPU, val: u8) u8 {
+        const msb = (val & 0x80) != 0;
+        const res = val << 1;
+        self.f = .{ .z = (res == 0), .n = false, .h = false, .c = msb };
+        return res;
+    }
+
+    fn sra_logic(self: *CPU, val: u8) u8 {
+        const lsb = (val & 0x01) != 0;
+        const res = (val >> 1) | (val & 0x80); // Keep MSB
+        self.f = .{ .z = (res == 0), .n = false, .h = false, .c = lsb };
+        return res;
+    }
+
+    fn srl_logic(self: *CPU, val: u8) u8 {
+        const lsb = (val & 0x01) != 0;
+        const res = val >> 1;
+        self.f = .{ .z = (res == 0), .n = false, .h = false, .c = lsb };
+        return res;
+    }
+
+    fn swap_logic(self: *CPU, val: u8) u8 {
+        const res = (val << 4) | (val >> 4);
+        self.f = .{ .z = (res == 0), .n = false, .h = false, .c = false };
+        return res;
+    }
+
     fn bit_test(self: *CPU, bit: u3, val: u8) void {
         self.f.z = (val & (@as(u8, 1) << bit)) == 0;
         self.f.n = false;
         self.f.h = true;
+    }
+
+    //===============================================================================================
+    // Interrupts
+    //===============================================================================================
+    pub fn handleInterrupts(self: *CPU) void {
+        const ie = self.readByte(0xFFFF);
+        const if_reg = self.readByte(0xFF0F);
+        const pending = ie & if_reg;
+
+        // DEBUG: Only print when a VBlank is requested to avoid flooding
+        if (if_reg & 0x01 != 0) {
+            std.debug.print("INT CHECK: IME: {}, IE: 0x{X:0>2}, IF: 0x{X:0>2}, Pending: 0x{X:0>2}\n", .{ self.ime, ie, if_reg, pending });
+        }
+
+        if (pending > 0) {
+            self.halted = false;
+
+            if (!self.ime) return;
+
+            // V-Blank has highest priority (Bit 0)
+            if ((pending & 0x01) != 0) {
+                std.debug.print("--- SERVICING VBLANK ---\n", .{});
+                self.serviceInterrupt(0, 0x0040);
+                return; // Only service one interrupt per check
+            }
+
+            // LCD Stat (Bit 1)
+            if ((pending & 0x02) != 0) {
+                self.serviceInterrupt(1, 0x0048);
+                return;
+            }
+
+            // Timer (Bit 2)
+            if ((pending & 0x04) != 0) {
+                self.serviceInterrupt(2, 0x0050);
+                return;
+            }
+
+            // Serial (Bit 3) and Joypad (Bit 4) would follow...
+        }
+    }
+
+    fn serviceInterrupt(self: *CPU, bit: u3, vector: u16) void {
+        self.ime = false;
+
+        // Clear the IF bit
+        const if_reg = self.readByte(0xFF0F);
+        self.writeByte(0xFF0F, if_reg & ~(@as(u8, 1) << bit));
+
+        // Use your helper! It handles the SP decrement and the two writes
+        self.push(self.pc);
+
+        self.pc = vector;
     }
 };

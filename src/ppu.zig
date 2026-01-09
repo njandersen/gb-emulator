@@ -34,14 +34,15 @@ pub const PPU = struct {
 
     pub fn tick(self: *PPU, m_cycles: u32, if_reg: *u8) void {
         self.dot_counter += m_cycles * 4;
-
-        if (self.dot_counter >= 456) {
+        while (self.dot_counter >= 456) {
             self.dot_counter -= 456;
+            const old_ly = self.ly;
             self.ly = (self.ly + 1) % 154;
 
-            // Now you can use the pointer we just added
-            if (self.ly == 144) {
-                if_reg.* |= 0x01; // Request V-Blank
+            if (self.ly == 144 and old_ly == 143) {
+                std.debug.print("!!! PPU: VBLANK TRIGGERED! Setting IF bit 0. IF before: 0x{X:0>2}\n", .{if_reg.*});
+                if_reg.* |= 0x01;
+                std.debug.print("!!! PPU: IF after: 0x{X:0>2}\n", .{if_reg.*});
             }
         }
     }

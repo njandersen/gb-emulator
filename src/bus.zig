@@ -12,30 +12,62 @@ pub const Bus = struct {
 
     ppu: PPU = .{},
 
+    pub fn init() Bus {
+        var bus = Bus{};
+        // Initialize hardware registers to post-boot state
+        bus.ie = 0x00;
+        bus.if_flag = 0xE1; // Initial state
+        bus.ppu.lcdc = 0x91;
+        bus.ppu.ly = 0x00;
+        // ... other registers
+        return bus;
+    }
+
     pub fn read(self: *Bus, addr: u16) u8 {
-        return switch (addr) {
+        const val = switch (addr) {
             0x0000...0x7FFF => self.rom[addr],
             0x8000...0x9FFF => self.ppu.vram[addr - 0x8000],
             0xC000...0xDFFF => self.wram[addr - 0xC000],
             0xFE00...0xFE9F => self.ppu.oam[addr - 0xFE00],
-            0xFF0F => self.if_flag,
+            0xFF0F => {
+                return self.if_flag;
+            },
             0xFF40...0xFF4B => self.ppu.readRegister(addr),
             0xFF80...0xFFFE => self.hram[addr - 0xFF80],
             0xFFFF => self.ie,
             else => 0xFF,
         };
+        // IF THE CPU IS READING LY, WE MUST SEE THIS
+        if (addr == 0xFF44) {
+            std.debug.print(">>> BUS HARDWARE: Address 0xFF44 read. Returning: {d}\n", .{val});
+        }
+        return val;
     }
 
     pub fn write(self: *Bus, addr: u16, val: u8) void {
+        // Add specific HRAM write tracking
+        if (addr >= 0xFF80 and addr <= 0xFFFE) {
+            std.debug.print(">>> HRAM WRITE: Addr 0x{X:0>4} Val 0x{X:0>2}\n", .{ addr, val });
+        }
+        // Only print "important" hardware register writes
+        if (addr >= 0xFF00) {
+            std.debug.print("--- HW WRITE: Addr 0x{X:0>4} Val 0x{X:0>2} ---\n", .{ addr, val });
+        }
         switch (addr) {
             0x0000...0x7FFF => {}, // ROM is read-only
             0x8000...0x9FFF => self.ppu.vram[addr - 0x8000] = val,
             0xC000...0xDFFF => self.wram[addr - 0xC000] = val,
             0xFE00...0xFE9F => self.ppu.oam[addr - 0xFE00] = val,
-            0xFF0F => self.if_flag = val,
+            0xFF0F => {
+                std.debug.print(">>> WARNING: IF Register written! Old: 0x{X:0>2} New: 0x{X:0>2}\n", .{ self.if_flag, val });
+                self.if_flag = val;
+            },
             0xFF40...0xFF4B => self.ppu.writeRegister(addr, val),
             0xFF80...0xFFFE => self.hram[addr - 0xFF80] = val,
-            0xFFFF => self.ie = val,
+            0xFFFF => {
+                std.debug.print(">>> BUS WRITE: IE Register (0xFFFF) set to 0x{X:0>2}\n", .{val});
+                self.ie = val;
+            },
             else => {},
         }
     }
