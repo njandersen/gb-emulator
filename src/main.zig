@@ -2,6 +2,7 @@ const std = @import("std");
 const gb_emulator = @import("gb_emulator");
 const cpu = @import("cpu.zig");
 const bus = @import("bus.zig");
+const Display = @import("display.zig").Display;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -20,17 +21,25 @@ pub fn main() !void {
     defer allocator.free(romData);
 
     newBus.loadROM(romData);
+
+    var display = try Display.init();
+    defer display.deinit();
+
     std.debug.print("ROM Loaded successfully. Starting emulation...\n", .{});
 
-    while (true) {
-        const cycles = newCpu.step();
-        if (cycles == 0) {
-            // If this is happening, the PPU never ticks!
-            std.debug.print("CRITICAL: CPU returned 0 cycles for PC 0x{X:0>4}\n", .{newCpu.pc});
+    // Remove most debug prints for performance!
+    while (!display.shouldClose()) {
+        // Run multiple cycles per frame for better performance
+        var cycles_this_frame: u32 = 0;
+        const cycles_per_frame = 70224; // ~60 FPS
+
+        while (cycles_this_frame < cycles_per_frame) {
+            const cycles = newCpu.step();
+            newBus.ppu.tick(cycles, &newBus.if_flag);
+            newCpu.handleInterrupts();
+            cycles_this_frame += cycles * 4; // Convert M-cycles to T-cycles
         }
 
-        newBus.ppu.tick(cycles, &newBus.if_flag);
-
-        newCpu.handleInterrupts();
+        display.render(&newBus.ppu);
     }
 }
